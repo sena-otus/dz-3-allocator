@@ -5,15 +5,65 @@
 #include <stdexcept>
 #include <bitset>
 
-
+/**
+ * Custom allocator with space reservation.
+ * Can not allocate more than blocksize*sizeof(T) at once.
+ * Store blocks in std::list.
+ * @tparam T type to allocate
+ * @tparam blocksize amount of T to preallocate
+ * */
 template <typename T, int blocksize>
 struct custom_allocator {
   using value_type = T;
+    /**
+     * default ctor allocates the empty list of blocks
+     *  */
   custom_allocator() noexcept : m_blocklist(std::make_shared<std::list<Block>>()) {};
   template <typename U, int blocksizeU>
-  custom_allocator (const custom_allocator<U,blocksizeU>& other) noexcept : m_blocklist(other) {}
-  T* allocate (std::size_t n);
-  void deallocate (T* p, std::size_t n);
+  explicit custom_allocator (const custom_allocator<U,blocksizeU>& other) noexcept : m_blocklist(other) {}
+
+
+    /**
+     * Alocator will try to allocate necessary blocksize first in existing
+     * blocks or add a new block if necessary
+     * @param n amount of objects to allocate
+     * @return pointer to allocated block
+     * */
+  T* allocate (std::size_t n)
+  {
+    if(n > blocksize) { throw std::bad_alloc(); }
+    for(auto && bi : *m_blocklist.get())
+    {
+      T *ptr = bi.allocate(n);
+      if(ptr != nullptr) { return ptr; }
+    };
+    auto &onemore = m_blocklist->emplace_back();
+    T *ptr = onemore.allocate(n);
+    if(ptr == nullptr) {  throw std::bad_alloc(); } // should never happen
+    return ptr;
+  }
+
+    /**
+     * That deallocator can throw if called with wrong p or n.
+     * Will free the block if there are no allocated elements in it.
+     * @param p pointer to deallocate
+     * @param n amount of objects
+     * */
+  void deallocate (T* p, std::size_t n)
+  {
+    if(n > blocksize) { throw  std::runtime_error{"try to deallocate too much"};}
+    for(auto bit = m_blocklist->begin(); bit != m_blocklist->end(); bit++)
+    {
+      if(bit->deallocate(p, n)) {
+          // delete empty block
+        if(bit->freeCount() == blocksize) {bit = m_blocklist->erase(bit); }
+        return;
+      }
+    }
+    throw  std::runtime_error{"try to deallocate bad ptr"};
+  }
+
+    /** tricky rebind should also accept the blocksize */
   template <typename U, int blocksizeU = blocksize> struct rebind { using other = custom_allocator<U, blocksizeU>; };
 
   using propagate_on_container_copy_assignment = std::true_type;
@@ -21,15 +71,17 @@ struct custom_allocator {
   using propagate_on_container_swap = std::true_type;
 private:
   struct Block;
-  std::shared_ptr<std::list<Block>> m_blocklist;
+  std::shared_ptr<std::list<Block>> m_blocklist; //<! can be shared between several instances
 };
 
+/** equal if point to same blocklist */
 template <class T, int blocksize, class U>
 constexpr bool operator== (const custom_allocator<T, blocksize>& lhs, const custom_allocator<U,blocksize>&rhs) noexcept
 {
   return lhs.m_blocklist == rhs.m_blocklist;
 }
 
+/** not equal if use different blocklists */
 template <class T, int blocksize, class U>
 constexpr bool operator!= (const custom_allocator<T, blocksize>&lhs, const custom_allocator<U, blocksize>&rhs) noexcept
 {
@@ -37,37 +89,11 @@ constexpr bool operator!= (const custom_allocator<T, blocksize>&lhs, const custo
 }
 
 
-template <typename T, int blocksize>
-T* custom_allocator<T,blocksize>::allocate (std::size_t n) {
-  if(n > blocksize) { throw std::bad_alloc(); }
-  for(auto && bi : *m_blocklist.get())
-  {
-    T *ptr = bi.allocate(n);
-    if(ptr != nullptr) { return ptr; }
-  }
-
-  auto &onemore = m_blocklist->emplace_back();
-  T *ptr = onemore.allocate(n);
-  if(ptr == nullptr) {  throw std::bad_alloc(); }
-  return ptr;
-}
-
-template <typename T, int blocksize>
-void custom_allocator<T, blocksize>::deallocate (T* p, std::size_t n) {
-  if(n > blocksize) { throw  std::runtime_error{"try to deallocate too much"};}
-  for(auto bit = m_blocklist->begin(); bit != m_blocklist->end(); bit++)
-  {
-    if(bit->deallocate(p, n)) {
-       // delete empty block
-      if(bit->freeCount() == blocksize) {bit = m_blocklist->erase(bit); }
-      return;
-    }
-  }
-  throw  std::runtime_error{"try to deallocate bad ptr"};
-}
-
-
-
+/**
+ * class Block can store blocksize instances of T
+ * @tparam T type to allocate
+ * @tparam blocksize amount of elements on block
+ *  */
 template <typename T, int blocksize>
 struct custom_allocator<T, blocksize>::Block
 {
@@ -75,7 +101,21 @@ struct custom_allocator<T, blocksize>::Block
     : m_arena(), m_used(), m_freeCount(blocksize)
     {}
 
+    /**
+     *  wrapper around reinterpret_cast to get T*
+     *  @param idx element index
+     *  @return pointer to element
+     *  */
+  T* arena(std::size_t idx)
+  {
+    return reinterpret_cast<T*>(&m_arena[idx]); // NOLINT
+  }
 
+    /**
+     * Search for the first coninues area of size n,
+     * mark it as used and
+     * @return nullptr on error, T* otherwise
+     *  */
   T* allocate(std::size_t n)
     {
       if(n == 0) {n++;}
@@ -98,15 +138,19 @@ struct custom_allocator<T, blocksize>::Block
             m_used[ii+kk] = true;
             m_freeCount--;
           }
-          return &m_arena[ii];
+          return arena(ii);
         }
       }
       return nullptr;
     }
 
+    /**
+     * mark given area as unused
+     * @return false on error, true otherwise
+     *  */
     bool deallocate (T* p, std::size_t n) {
-      if(p < m_arena.data()) { return false; }
-      auto index = p-m_arena.data();
+      if(p < arena(0)) { return false; }
+      auto index = p-arena(0);
       if(index >= blocksize) { return false; }
       for(std::size_t kk = 0; kk < n; ++kk)
       { // TODO: possible check for double-free
@@ -118,8 +162,13 @@ struct custom_allocator<T, blocksize>::Block
 
     auto freeCount() const { return m_freeCount; }
 
-  private:
-    std::array<T, blocksize> m_arena;
-    std::bitset<blocksize> m_used;
-    std::size_t m_freeCount;
+private:
+    /**
+     * Objects will be stored in that array.
+     * Can not use array<T,blocksize> because default constructor for
+     * each element will be called.
+     * */
+  std::array<std::aligned_storage_t<sizeof(T), alignof(T)>, blocksize> m_arena;
+  std::bitset<blocksize> m_used; ///<! Here we mark used elements
+  std::size_t m_freeCount; ///<! amount of free elements to speedup some checks
 };

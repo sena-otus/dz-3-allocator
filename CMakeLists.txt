@@ -19,7 +19,7 @@ endif()
 
 configure_file(version.h.in version.h)
 
-add_executable(allocator allocator.cpp)
+add_executable(allocator main.cpp)
 
 set_target_properties(allocator PROPERTIES
     CXX_STANDARD 20
